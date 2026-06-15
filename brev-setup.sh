@@ -4,6 +4,7 @@
 # Tested: Ubuntu 22.04, NVIDIA L40S, Driver 580, CUDA 13.0, Isaac Sim 6.0
 #
 # What gets installed (all on host, no Docker):
+#   - ip-refresh.service             → 开机时自动更新公网 IP（coturn + Selkies）
 #   - headless Xorg + NVIDIA driver  → Isaac Sim RTX GPU 全速渲染
 #   - xfwm4 + xfdesktop              → 轻量桌面（避免 xfce4-session segfault）
 #   - Selkies-GStreamer (systemd)     → nvh264enc 硬件编码流媒体
@@ -11,9 +12,6 @@
 #   - Isaac Sim 6.0 (pip, Python3.12)
 #   - Oh-My-Zsh + Powerlevel10k
 #   - Claude Code (Node.js 20)
-#
-# Idempotent: re-running after reboot skips already-done steps,
-#             only rewrites Xorg config + coturn IP (may change on restart).
 # =============================================================================
 set -euo pipefail
 
@@ -38,6 +36,7 @@ DISPLAY_NUM=":0"
 SELKIES_INSTALL_DIR="/opt/selkies-gstreamer"
 XORG_CONF="/etc/X11/xorg.conf"
 TURN_SECRET_FILE="/etc/selkies-turn-secret"
+IP_REFRESH_SCRIPT="/usr/local/bin/selkies-ip-refresh.sh"
 
 [[ "$(id -u)" == "0" ]] || die "Run as root: curl ... | sudo -E bash"
 
@@ -48,7 +47,6 @@ step "STEP 0: Detecting public IP"
 
 detect_public_ip() {
   local ip
-  # AWS metadata (link-local, always works on Brev/EC2)
   ip=$(curl -fsSL --max-time 3 http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null || true)
   [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && { echo "$ip"; return 0; }
   for url in https://icanhazip.com https://api.ipify.org https://ifconfig.me/ip; do
@@ -70,23 +68,16 @@ step "STEP 1: System dependencies"
 apt-get update -qq
 
 ALL_PKGS=(
-  # Base tools
   curl wget git jq tar gzip ca-certificates software-properties-common build-essential zsh
-  # Xorg + NVIDIA driver support
   xserver-xorg-core xserver-xorg-legacy x11-utils x11-xserver-utils x11-xkb-utils xauth
-  # Desktop (xfwm4 + xfdesktop, avoids xfce4-session segfault in headless systemd)
   xfwm4 xfdesktop4 xfce4-terminal xdg-utils dbus-x11
-  # Selkies host deps (official list)
   libpulse0 pulseaudio
   wayland-protocols libwayland-dev libwayland-egl1
   libx11-xcb1 libxcb-dri3-0 libxkbcommon0 libxdamage1 libxfixes3 libxv1 libxtst6 libxext6
-  # Isaac Sim runtime deps (fixes libGLU segfault)
   libglu1-mesa libglu1-mesa-dev
   libgl1-mesa-glx libglx-mesa0 libegl1-mesa
   libxi6 libxrandr2 libxcursor1 libxinerama1 libxxf86vm1
-  # coturn TURN server
   coturn
-  # Python
   python3-pip python3-venv
 )
 
@@ -104,7 +95,6 @@ else
   log "System packages already present — skipping"
 fi
 
-# Python 3.12 (Isaac Sim 6.0 requirement)
 if python3.12 --version &>/dev/null; then
   log "Python 3.12 already installed — skipping"
 else
@@ -116,22 +106,114 @@ else
 fi
 
 # =============================================================================
-# STEP 2: Headless Xorg config (always rewrite — BusID may change on restart)
+# STEP 2: IP Refresh service
+# Runs at boot BEFORE coturn/Selkies, detects new public IP and updates:
+#   - /etc/turnserver.conf  (external-ip=)
+#   - selkies-desktop.service (--turn_host=)
+# Then restarts coturn and selkies-desktop so they use the new IP.
 # =============================================================================
-step "STEP 2: Headless Xorg + NVIDIA GPU"
+step "STEP 2: IP Refresh service (boot-time auto IP update)"
 
-# Allow Xorg to run as non-root under systemd
+# Write the refresh script
+cat > "$IP_REFRESH_SCRIPT" << 'REFRESH'
+#!/usr/bin/env bash
+# selkies-ip-refresh.sh
+# Detects current public IP and updates coturn + Selkies config.
+# Run at boot via ip-refresh.service, before coturn and selkies-desktop.
+set -euo pipefail
+
+log() { echo "[$(date -u '+%H:%M:%S')] $*"; }
+
+detect_ip() {
+  local ip
+  ip=$(curl -fsSL --max-time 3 http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null || true)
+  [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && { echo "$ip"; return 0; }
+  for url in https://icanhazip.com https://api.ipify.org https://ifconfig.me/ip; do
+    ip=$(curl -fsSL --max-time 5 "$url" 2>/dev/null | tr -d '[:space:]' || true)
+    [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && { echo "$ip"; return 0; }
+  done
+  return 1
+}
+
+NEW_IP=$(detect_ip || true)
+if [[ -z "$NEW_IP" ]]; then
+  log "ERROR: Could not detect public IP, skipping update"
+  exit 1
+fi
+
+# Read current IP from coturn config
+CURRENT_IP=$(grep -oP '(?<=external-ip=)[0-9.]+' /etc/turnserver.conf 2>/dev/null || true)
+
+if [[ "$NEW_IP" == "$CURRENT_IP" ]]; then
+  log "IP unchanged ($NEW_IP), no update needed"
+  exit 0
+fi
+
+log "IP changed: $CURRENT_IP → $NEW_IP, updating configs..."
+
+# Update coturn
+sed -i "s/^external-ip=.*/external-ip=${NEW_IP}/" /etc/turnserver.conf
+log "coturn config updated"
+
+# Update Selkies service
+sed -i "s/--turn_host=[0-9.]*/--turn_host=${NEW_IP}/" \
+  /etc/systemd/system/selkies-desktop.service
+systemctl daemon-reload
+log "selkies-desktop service updated"
+
+# Save new IP for reference
+echo "$NEW_IP" > /etc/selkies-current-ip
+
+log "IP refresh complete: $NEW_IP"
+REFRESH
+
+chmod +x "$IP_REFRESH_SCRIPT"
+
+# Write the systemd service
+cat > /etc/systemd/system/ip-refresh.service << 'IPSERVICE'
+[Unit]
+Description=Selkies IP Refresh (update TURN IP on boot)
+# Must run before coturn and selkies-desktop
+Before=coturn.service selkies-desktop.service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/selkies-ip-refresh.sh
+RemainAfterExit=yes
+# Log output to journald
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+IPSERVICE
+
+systemctl daemon-reload
+systemctl enable ip-refresh.service > /dev/null 2>&1
+# Run it now to apply current IP immediately
+systemctl start ip-refresh.service
+log "IP refresh service installed and executed"
+
+# Show result
+REFRESHED_IP=$(cat /etc/selkies-current-ip 2>/dev/null || echo "unknown")
+log "Current IP in configs: $REFRESHED_IP"
+
+# =============================================================================
+# STEP 3: Headless Xorg config (always rewrite — BusID may change on restart)
+# =============================================================================
+step "STEP 3: Headless Xorg + NVIDIA GPU"
+
 cat > /etc/X11/Xwrapper.config << 'XWRAP'
 allowed_users=anybody
 needs_root_rights=yes
 XWRAP
 
-# Dynamically detect GPU PCI BusID
 get_gpu_busid() {
   local raw
   raw=$(nvidia-smi --query-gpu=pci.bus_id --format=csv,noheader 2>/dev/null | head -1 || true)
   [[ -z "$raw" ]] && { echo "PCI:0:0:0"; return; }
-  # Format: 00000000:30:00.0 → PCI:48:0:0
   local domain bus slot func
   IFS=':.' read -r domain bus slot func <<< "$raw"
   echo "PCI:$((16#$bus)):$((16#$slot)):$((16#${func:-0}))"
@@ -177,9 +259,9 @@ XORGEOF
 log "Xorg config written (BusID: ${GPU_BUSID})"
 
 # =============================================================================
-# STEP 3: Selkies-GStreamer portable tarball
+# STEP 4: Selkies-GStreamer
 # =============================================================================
-step "STEP 3: Selkies-GStreamer"
+step "STEP 4: Selkies-GStreamer"
 
 install_selkies() {
   info "Fetching latest Selkies-GStreamer release..."
@@ -202,10 +284,9 @@ else
 fi
 
 # =============================================================================
-# STEP 4: coturn TURN server (UDP only — turn_enable_tcp not supported)
-# Config always rewritten to keep external-ip current after instance restart.
+# STEP 5: coturn TURN server
 # =============================================================================
-step "STEP 4: coturn TURN server"
+step "STEP 5: coturn TURN server"
 
 [[ ! -f "$TURN_SECRET_FILE" ]] && openssl rand -hex 16 > "$TURN_SECRET_FILE"
 TURN_SECRET=$(cat "$TURN_SECRET_FILE")
@@ -229,30 +310,26 @@ log-file=/var/log/turnserver.log
 pidfile=/var/run/turnserver.pid
 TURNEOF
 
+# Fix log file permissions so coturn can write it
+touch /var/log/turnserver.log
+chmod 666 /var/log/turnserver.log
+
 systemctl enable coturn > /dev/null 2>&1 || true
 systemctl restart coturn
-log "coturn running on port ${TURN_PORT} (UDP ${TURN_MIN_PORT}-${TURN_MAX_PORT})"
+log "coturn running on port ${TURN_PORT}"
 
 # =============================================================================
-# STEP 5: systemd services
-#
-# Three-service chain: xorg-gpu → xfce4-session → selkies-desktop
-#
-# xfce4-session fix: use xfwm4 --replace + xfdesktop directly instead of
-# startxfce4 / xfce4-session, which segfaults in headless systemd environments.
-#
-# selkies-desktop fix: removed --turn_enable_tcp (unrecognized argument in
-# this version of Selkies-GStreamer).
+# STEP 6: Systemd services (xorg-gpu → xfce4-session → selkies-desktop)
 # =============================================================================
-step "STEP 5: Systemd services"
+step "STEP 6: Systemd services"
 
 RUNTIME_DIR="/tmp/runtime-${UBUNTU_USER}"
 
-# ── 5a. Xorg GPU service ──────────────────────────────────────────────────────
+# ── 6a. Xorg GPU ──────────────────────────────────────────────────────────────
 cat > /etc/systemd/system/xorg-gpu.service << XORGSERVICE
 [Unit]
 Description=Xorg GPU Display Server (headless NVIDIA)
-After=nvidia-persistenced.service
+After=network.target nvidia-persistenced.service
 Wants=nvidia-persistenced.service
 
 [Service]
@@ -267,9 +344,7 @@ RestartSec=3
 WantedBy=multi-user.target
 XORGSERVICE
 
-# ── 5b. Desktop session service ───────────────────────────────────────────────
-# Uses xfwm4 --replace + xfdesktop directly.
-# startxfce4/xfce4-session causes SIGSEGV in headless systemd (no logind seat).
+# ── 6b. Desktop (xfwm4 + xfdesktop) ──────────────────────────────────────────
 cat > /etc/systemd/system/xfce4-session.service << XFCESERVICE
 [Unit]
 Description=Xfce4 Desktop Session (xfwm4 + xfdesktop)
@@ -293,12 +368,11 @@ RestartSec=5
 WantedBy=multi-user.target
 XFCESERVICE
 
-# ── 5c. Selkies streaming service ─────────────────────────────────────────────
-# Note: --turn_enable_tcp removed (not supported in this Selkies version).
+# ── 6c. Selkies streaming ─────────────────────────────────────────────────────
 cat > /etc/systemd/system/selkies-desktop.service << SELKIESSERVICE
 [Unit]
 Description=Selkies WebRTC Remote Desktop Stream
-After=xfce4-session.service
+After=xfce4-session.service ip-refresh.service
 Requires=xfce4-session.service
 
 [Service]
@@ -308,7 +382,6 @@ Environment=DISPLAY=${DISPLAY_NUM}
 Environment=XDG_RUNTIME_DIR=${RUNTIME_DIR}
 Environment=PULSE_RUNTIME_PATH=${RUNTIME_DIR}/pulse
 Environment=PULSE_SERVER=unix:${RUNTIME_DIR}/pulse/native
-Environment=PIPEWIRE_LATENCY=128/48000
 
 ExecStartPre=/bin/bash -c 'mkdir -p ${RUNTIME_DIR}/pulse'
 ExecStartPre=/bin/bash -c 'sleep 5'
@@ -349,15 +422,14 @@ for i in $(seq 1 24); do
     log "Selkies healthcheck passed ✓"
     break
   fi
-  [[ $i -eq 24 ]] && warn "Selkies not yet responding — check: journalctl -u selkies-desktop -f"
+  [[ $i -eq 24 ]] && warn "Selkies not responding — check: journalctl -u selkies-desktop -f"
   sleep 5
 done
 
 # =============================================================================
-# STEP 6: Isaac Sim 6.0 via pip (idempotent)
-# Shader pre-warm runs after Xorg is up to avoid segfault in --no-window mode.
+# STEP 7: Isaac Sim 6.0 via pip (idempotent + shader pre-warm after Xorg up)
 # =============================================================================
-step "STEP 6: Isaac Sim ${ISAAC_VERSION}"
+step "STEP 7: Isaac Sim ${ISAAC_VERSION}"
 
 ISAAC_INSTALLED_VERSION=""
 if [[ -f "${VENV_DIR}/bin/python" ]]; then
@@ -388,9 +460,8 @@ else
   "
   log "Isaac Sim ${ISAAC_VERSION} installed"
 
-  # Shader pre-warm: run after Xorg is up (avoids segfault from earlier)
-  # Xorg is now running at this point in the script.
-  info "Pre-warming Isaac Sim shaders (~5 min, requires Xorg to be running)..."
+  # Shader pre-warm — Xorg is now up (Step 6 already ran)
+  info "Pre-warming Isaac Sim shaders (~5 min)..."
   sudo -u "$UBUNTU_USER" bash -c "
     source ${VENV_DIR}/bin/activate
     export OMNI_KIT_ACCEPT_EULA=YES
@@ -403,7 +474,7 @@ else
   " && log "Shader pre-warm complete" || warn "Shader pre-warm failed (non-fatal)"
 fi
 
-# Launcher script (always rewrite)
+# Launcher script
 cat > "${UBUNTU_HOME}/launch-isaac-sim.sh" << 'LAUNCHER'
 #!/usr/bin/env bash
 export DISPLAY="${DISPLAY:-:0}"
@@ -414,7 +485,6 @@ LAUNCHER
 chmod +x "${UBUNTU_HOME}/launch-isaac-sim.sh"
 chown "${UBUNTU_USER}:${UBUNTU_USER}" "${UBUNTU_HOME}/launch-isaac-sim.sh"
 
-# Desktop shortcut
 mkdir -p "${UBUNTU_HOME}/Desktop"
 cat > "${UBUNTU_HOME}/Desktop/IsaacSim.desktop" << 'DESKTOP'
 [Desktop Entry]
@@ -429,9 +499,9 @@ chmod +x "${UBUNTU_HOME}/Desktop/IsaacSim.desktop"
 chown -R "${UBUNTU_USER}:${UBUNTU_USER}" "${UBUNTU_HOME}/Desktop"
 
 # =============================================================================
-# STEP 7: Oh-My-Zsh + plugins (idempotent)
+# STEP 8: Oh-My-Zsh + plugins (idempotent)
 # =============================================================================
-step "STEP 7: Oh-My-Zsh"
+step "STEP 8: Oh-My-Zsh"
 
 if [[ ! -d "${UBUNTU_HOME}/.oh-my-zsh" ]]; then
   sudo -u "$UBUNTU_USER" bash -c \
@@ -452,18 +522,15 @@ clone_if_missing https://github.com/zsh-users/zsh-autosuggestions    "${ZSH_CUST
 clone_if_missing https://github.com/zsh-users/zsh-syntax-highlighting "${ZSH_CUSTOM}/plugins/zsh-syntax-highlighting"
 clone_if_missing https://github.com/romkatv/powerlevel10k.git          "${ZSH_CUSTOM}/themes/powerlevel10k"
 
-# .zshrc (always rewrite)
 sudo -u "$UBUNTU_USER" tee "${UBUNTU_HOME}/.zshrc" > /dev/null << 'ZSHRC'
 export ZSH="$HOME/.oh-my-zsh"
 ZSH_THEME="powerlevel10k/powerlevel10k"
 plugins=(git zsh-autosuggestions zsh-syntax-highlighting docker python history)
 source $ZSH/oh-my-zsh.sh
 
-# Isaac Sim
 alias isaac='source ~/isaac-venv/bin/activate'
 alias isaacsim-run='~/launch-isaac-sim.sh'
 
-# nvm
 export NVM_DIR="$HOME/.nvm"
 [ -s "$NVM_DIR/nvm.sh" ]          && source "$NVM_DIR/nvm.sh"
 [ -s "$NVM_DIR/bash_completion" ] && source "$NVM_DIR/bash_completion"
@@ -478,9 +545,9 @@ CURRENT_SHELL=$(getent passwd "$UBUNTU_USER" | cut -d: -f7)
   || { chsh -s "$(which zsh)" "$UBUNTU_USER"; log "Default shell set to zsh"; }
 
 # =============================================================================
-# STEP 8: Node.js 20 + Claude Code (idempotent)
+# STEP 9: Node.js 20 + Claude Code (idempotent)
 # =============================================================================
-step "STEP 8: Node.js + Claude Code"
+step "STEP 9: Node.js + Claude Code"
 
 CLAUDE_INSTALLED=false
 sudo -u "$UBUNTU_USER" bash -c '
@@ -527,8 +594,10 @@ echo -e "${GREEN}║    UDP         : 47998 (TURN)                      ║${NC}
 echo -e "${GREEN}║    UDP range   : 47999-48015 (TURN relay)          ║${NC}"
 echo -e "${GREEN}╠════════════════════════════════════════════════════╣${NC}"
 echo -e "${GREEN}║  Debug:                                            ║${NC}"
+echo -e "${GREEN}║    journalctl -u ip-refresh -f                     ║${NC}"
 echo -e "${GREEN}║    journalctl -u xorg-gpu -f                       ║${NC}"
 echo -e "${GREEN}║    journalctl -u xfce4-session -f                  ║${NC}"
 echo -e "${GREEN}║    journalctl -u selkies-desktop -f                ║${NC}"
-echo -e "${GREEN}║    nvidia-smi  (verify GPU processes)              ║${NC}"
+echo -e "${GREEN}║    cat /etc/selkies-current-ip                     ║${NC}"
+echo -e "${GREEN}║    nvidia-smi                                      ║${NC}"
 echo -e "${GREEN}╚════════════════════════════════════════════════════╝${NC}"
