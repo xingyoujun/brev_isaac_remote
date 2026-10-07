@@ -20,6 +20,13 @@
 # =============================================================================
 set -euo pipefail
 
+# 非交互 apt; needrestart 只列出不重启服务 (避免装包时把 Brev agent / sshd / jupyter 等重启掉)
+export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=l
+export NEEDRESTART_SUSPEND=1
+# 默认不改登录 shell (Brev 的连接/工具走 bash 最稳); 需要时 CHANGE_SHELL=1
+CHANGE_SHELL="${CHANGE_SHELL:-0}"
+
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; RED='\033[0;31m'; NC='\033[0m'
 log()  { echo -e "${GREEN}[$(date -u '+%H:%M:%S')] ✓ $*${NC}"; }
 info() { echo -e "${CYAN}[$(date -u '+%H:%M:%S')]   $*${NC}"; }
@@ -100,6 +107,8 @@ else
     apt-get install -y --no-install-recommends "${CUDA_PKG}"
   log "CUDA ${CUDA_VER} toolkit installed → ${CUDA_DIR}"
 fi
+apt-get clean
+df -h / | tail -1
 
 # =============================================================================
 # STEP 3: Miniconda  →  ~/miniconda3
@@ -168,6 +177,7 @@ clone_if_missing https://github.com/romkatv/powerlevel10k.git          "${ZSH_CU
 # 注意: 'ZSHRC' 用单引号包裹 => heredoc 内所有 $ 均按字面写入, 运行时再展开
 sudo -u "$UBUNTU_USER" tee "${UBUNTU_HOME}/.zshrc" > /dev/null << 'ZSHRC'
 export ZSH="$HOME/.oh-my-zsh"
+POWERLEVEL9K_DISABLE_CONFIGURATION_WIZARD=true
 ZSH_THEME="powerlevel10k/powerlevel10k"
 plugins=(git zsh-autosuggestions zsh-syntax-highlighting python history)
 source $ZSH/oh-my-zsh.sh
@@ -200,10 +210,18 @@ unset __conda_setup
 ZSHRC
 log ".zshrc written (CUDA + conda + nvm)"
 
-CURRENT_SHELL=$(getent passwd "$UBUNTU_USER" | cut -d: -f7)
-[[ "$CURRENT_SHELL" == "$(which zsh)" ]] \
-  && log "zsh already default shell — skipping" \
-  || { chsh -s "$(which zsh)" "$UBUNTU_USER"; log "Default shell set to zsh"; }
+if [[ "$CHANGE_SHELL" == "1" ]]; then
+  CURRENT_SHELL=$(getent passwd "$UBUNTU_USER" | cut -d: -f7)
+  [[ "$CURRENT_SHELL" == "$(which zsh)" ]] \
+    && log "zsh already default shell — skipping" \
+    || { chsh -s "$(which zsh)" "$UBUNTU_USER"; log "Default shell set to zsh"; }
+else
+  # 登录 shell 保持 bash; 交互式 SSH 时自动切到 zsh (非交互命令/工具不受影响)
+  grep -q 'exec zsh' "${UBUNTU_HOME}/.bashrc" 2>/dev/null || \
+    echo '[[ $- == *i* && -t 1 && -x "$(command -v zsh)" && -z "${ZSH_VERSION:-}" ]] && exec zsh' \
+      | sudo -u "$UBUNTU_USER" tee -a "${UBUNTU_HOME}/.bashrc" > /dev/null
+  log "Login shell kept as bash; interactive SSH auto-execs zsh"
+fi
 
 # =============================================================================
 # STEP 6: Node.js 20 + Claude Code (idempotent)
